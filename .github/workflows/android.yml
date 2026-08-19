@@ -20,30 +20,77 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Unpack project (when the repo holds only the zip)
+      - name: Unpack project (handles plain, wrapper and nested zips)
         run: |
           set -euo pipefail
-          if [ ! -f project.godot ]; then
-            Z="$(ls -1 *.zip 2>/dev/null | head -n1 || true)"
-            if [ -z "$Z" ]; then
-              echo "No project.godot and no .zip in the repository root."
+
+          if [ -f project.godot ]; then
+            echo "project.godot is already in the repository root - nothing to unpack."
+          else
+            rm -rf _unpack
+            mkdir -p _unpack
+
+            # 1. copy every zip of the repo (root or up to 2 folders deep) into _unpack
+            n=0
+            while IFS= read -r Z; do
+              n=$((n + 1))
+              mkdir -p "_unpack/z$n"
+              echo "unzip -> _unpack/z$n : $Z"
+              unzip -q -o "$Z" -d "_unpack/z$n" || echo "  (skipped: not a readable zip)"
+            done < <(find . -maxdepth 3 -name '*.zip' -not -path './_unpack/*' | sort)
+
+            if [ "$n" -eq 0 ]; then
+              echo "No project.godot and no .zip anywhere in the repository."
               exit 1
             fi
-            echo "Unpacking $Z"
-            mkdir -p _unzipped
-            unzip -q "$Z" -d _unzipped
-            SRC="$(dirname "$(find _unzipped -name project.godot | head -n1)")"
-            if [ -z "$SRC" ]; then
-              echo "project.godot not found inside $Z"
+
+            # 2. the repo zip may itself only contain the project zip: expand nested
+            #    archives too (3 passes is plenty for any sane layout)
+            for pass in 1 2 3; do
+              found_nested=0
+              while IFS= read -r NZ; do
+                found_nested=1
+                D="${NZ%.zip}_x"
+                mkdir -p "$D"
+                echo "nested unzip -> $D : $NZ"
+                unzip -q -o "$NZ" -d "$D" || true
+                rm -f "$NZ"
+              done < <(find _unpack -name '*.zip')
+              if [ "$found_nested" -eq 0 ]; then
+                break
+              fi
+            done
+
+            # 3. pick the project with the highest config/version (so an old zip
+            #    left in the repo can never win over the new one)
+            BEST=""
+            BEST_V=""
+            while IFS= read -r P; do
+              V="$(sed -n 's/^config\/version="\(.*\)"$/\1/p' "$P" | head -n1)"
+              [ -z "$V" ] && V="0"
+              echo "candidate: $P (version $V)"
+              if [ -z "$BEST" ] || [ "$(printf '%s\n%s\n' "$BEST_V" "$V" | sort -V | tail -n1)" = "$V" ]; then
+                BEST="$P"
+                BEST_V="$V"
+              fi
+            done < <(find _unpack -name project.godot | sort)
+
+            if [ -z "$BEST" ]; then
+              echo "project.godot was not found inside any archive:"
+              find _unpack -maxdepth 3 | head -n 40
               exit 1
             fi
-            shopt -s dotglob
-            cp -rn "$SRC"/* . || true
-            shopt -u dotglob
-            rm -rf _unzipped
+
+            SRC="$(dirname "$BEST")"
+            echo "Using project $SRC (version $BEST_V)"
+            cp -a "$SRC/." .
+            rm -rf _unpack
           fi
+
           ls -1 | head -n 20
           test -f project.godot
+          test -d scripts
+          test -f export_presets.cfg
 
       - name: Static checks (custom linters)
         run: |
