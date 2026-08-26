@@ -189,6 +189,44 @@ jobs:
           godot --headless --import .
           echo "imported files: $(find .godot/imported -type f 2>/dev/null | wc -l)"
 
+      - name: Smoke test (boot the game headless, fail on any script error)
+        run: |
+          set -uo pipefail
+          # v4.0.0 shipped an APK that booted to a flat clear-colour screen: a
+          # duplicated member killed Game.gd at compile time, and nothing in the
+          # pipeline noticed because a broken script is not a broken export.
+          # From now on the build actually RUNS the game before it is packaged.
+          FAIL=0
+          run_scene () {
+            NAME="$1"; SCENE="$2"
+            echo "::group::boot $NAME"
+            if [ -z "$SCENE" ]; then
+              timeout 120 godot --headless --quit-after 240 > "log_$NAME.txt" 2>&1 || true
+            else
+              timeout 120 godot --headless --quit-after 240 "$SCENE" > "log_$NAME.txt" 2>&1 || true
+            fi
+            tail -n 60 "log_$NAME.txt"
+            echo "::endgroup::"
+            if grep -nE "SCRIPT ERROR|Parse Error|Compile Error|Failed to instantiate|Invalid call|Invalid get index|Invalid set index|Cannot call method|Attempt to call|already exists in|Condition \"" "log_$NAME.txt"; then
+              echo "::error::$NAME booted with script errors (see above)"
+              FAIL=1
+            fi
+            if [ ! -s "log_$NAME.txt" ]; then
+              echo "::warning::$NAME produced no log output"
+            fi
+          }
+          run_scene menu ""
+          run_scene game "res://Game.tscn"
+          exit $FAIL
+
+      - name: Upload boot logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-logs
+          path: log_*.txt
+          if-no-files-found: warn
+
       - name: Export debug APK
         run: |
           set -euo pipefail
